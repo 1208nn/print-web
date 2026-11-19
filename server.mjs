@@ -31,6 +31,8 @@ const CFG = {
   lpstat: process.env.LPSTAT || 'lpstat',
   cancel: process.env.CANCEL || 'cancel',
   gs: process.env.GS || 'gs',
+  rsvg: process.env.RSVG || 'rsvg-convert',
+  unite: process.env.PDFUNITE || 'pdfunite',
   maxBytes: Number(process.env.MAX_MB || 50) * 1024 * 1024,
   queueMax: Number(process.env.QUEUE_MAX || 20),
   dryRun: process.env.DRY_RUN === '1',
@@ -44,7 +46,9 @@ const CFG = {
 const TMP = os.tmpdir();
 const HAVE_PDFINFO = spawnSync('pdfinfo', ['-v'], { stdio: 'ignore' }).status === 0;
 const HAVE_QR = spawnSync('qrencode', ['-V'], { stdio: 'ignore' }).status === 0;
-const LAN_NAME = lanName();
+const HAVE_RSVG = spawnSync(CFG.rsvg, ['--version'], { stdio: 'ignore' }).status === 0;
+const HAVE_UNITE = spawnSync(CFG.unite, ['-v'], { stdio: 'ignore' }).status === 0;
+const LAN_HOST = lanHost();
 
 const cupsArgs = () => CFG.server ? ['-h', CFG.server] : [];
 
@@ -60,20 +64,26 @@ async function defaultQueue() {
   }
 }
 
-async function lanName() {
-  const base = os.hostname();
-  const probes = [
-    [`${base}.local`, 'avahi-resolve', ['-n', `${base}.local`]],
-    [`${base}.local`, 'getent', ['hosts', `${base}.local`]],
-    [`${base}.lan`, 'getent', ['hosts', `${base}.lan`]],
-  ];
-  for (const [name, cmd, args] of probes) {
-    try {
-      await run(cmd, args);
-      return name;
-    } catch { /* 换下一种解析方式 */ }
+/* OpenWrt 的 dnsmasq 解析 <hostname>.lan；解析不到就用本机局域网 IPv4。 */
+async function lanHost() {
+  const name = `${os.hostname()}.lan`;
+  try {
+    await run('getent', ['hosts', name]);
+    return name;
+  } catch {
+    return primaryIPv4();
   }
-  return '';
+}
+
+function primaryIPv4() {
+  const score = (a) => a.startsWith('192.168.') ? 0
+    : a.startsWith('10.') ? 1
+    : /^172\.(1[6-9]|2\d|3[01])\./.test(a) ? 2 : 3;
+  const list = Object.values(os.networkInterfaces()).flat()
+    .filter((n) => n && n.family === 'IPv4' && !n.internal && !n.address.startsWith('169.254.'))
+    .map((n) => n.address)
+    .sort((a, b) => score(a) - score(b));
+  return list[0] || 'localhost';
 }
 
 /* ------------------------------------------------------------------ 任务状态 */
@@ -462,15 +472,13 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'POST' && url.pathname === '/api/test') {
       if (!QUEUE) return json(res, 503, { error: '服务器没有配置打印队列' });
+      if (!HAVE_RSVG || !HAVE_UNITE) return json(res, 500, { error: '测试页需要 rsvg-convert 和 pdfunite' });
       const opts = parseOpts(url);
-      const tmp = path.join(TMP, `printweb-test-${crypto.randomBytes(4).toString('hex')}.ps`);
-      await fsp.writeFile(tmp, await testPage(await pageUrl(req)));
       let src;
       try {
-        src = await psToPdf(tmp);
+        src = await buildTestPage(await pageUrl());
       } catch (e) {
-        try { await fsp.unlink(tmp); } catch {}
-        return json(res, 500, { error: `测试页转换失败：${e.message}` });
+        return json(res, 500, { error: `测试页生成失败：${e.message}` });
       }
       const size = (await fsp.stat(src)).size;
       const job = newJob({ name: '测试页', size, kind: 'pdf', pages: 2, copies: 1, opts, __tmp: src });
@@ -487,72 +495,91 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-async function pageUrl(req) {
-  const host = (await LAN_NAME) || String(req.headers.host || '').replace(/:\d+$/, '') || 'localhost';
+async function pageUrl() {
+  const host = await LAN_HOST;
   return `http://${host}${CFG.port === 80 ? '' : `:${CFG.port}`}`;
 }
 
-const psText = (s) => s.replace(/[()\\]/g, '\\$&');
+const FONT = "'DejaVu Sans','WenQuanYi Zen Hei','Noto Sans CJK SC','Source Han Sans SC',sans-serif";
+const xml = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const svgText = (x, y, size, text, attrs = '') =>
+  `<text x="${x}" y="${y}" font-family="${FONT}" font-size="${size}"${attrs}>${xml(text)}</text>`;
+const svgPage = (inner) =>
+  `<svg xmlns="http://www.w3.org/2000/svg" width="595" height="842" viewBox="0 0 595 842">` +
+  `<rect width="595" height="842" fill="#fff"/>${inner}</svg>`;
 
-/* qrencode 的 ASCII 输出每个模块两列，按行合并连续暗块后画成矩形。 */
-function qrOps(ascii, x, y, size) {
+/* qrencode 的 ASCII 输出每个模块两列，按行合并连续暗块后画成一个 path。 */
+function qrSvg(ascii, x, y, size) {
   const rows = ascii.replace(/\n+$/, '').split('\n');
   const n = rows.length;
   const m = size / n;
-  const ops = ['gsave', '0 setgray', `${x} ${y} translate`];
+  const d = [];
   rows.forEach((row, r) => {
     let c = 0;
     while (c * 2 < row.length) {
       if (row[c * 2] !== '#') { c++; continue; }
       const start = c;
       while (c * 2 < row.length && row[c * 2] === '#') c++;
-      const w = (c - start) * m;
-      ops.push(`${(start * m).toFixed(2)} ${((n - 1 - r) * m).toFixed(2)} ${w.toFixed(2)} ${m.toFixed(2)} rectfill`);
+      const w = ((c - start) * m).toFixed(2);
+      d.push(`M${(x + start * m).toFixed(2)} ${(y + r * m).toFixed(2)}h${w}v${m.toFixed(2)}h-${w}z`);
     }
   });
-  ops.push('grestore');
-  return ops.join('\n');
+  return `<path fill="#000" d="${d.join('')}"/>`;
 }
 
-async function testPage(url) {
-  const lines = [
-    '%!PS-Adobe-3.0',
-    '/Helvetica-Bold findfont 24 scalefont setfont',
-    '72 720 moveto (Print-Web Test Page) show',
-    '/Helvetica findfont 12 scalefont setfont',
-    '72 690 moveto (If you can read this, the queue is working.) show',
-    `72 670 moveto (Time: ${psText(new Date().toISOString())}) show`,
-    '72 640 moveto (Page 1 of 2. With duplex on, the back is the other half.) show',
-  ];
-
+async function testPages(url) {
+  const stamp = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+  let qr = '';
   if (HAVE_QR) {
     try {
       const ascii = await run('qrencode', ['-t', 'ASCII', '-m', '2', '-o', '-', url]);
-      lines.push(qrOps(ascii, 396, 430, 150));
-      lines.push('/Helvetica-Bold findfont 10 scalefont setfont');
-      lines.push(`396 414 moveto (${psText('Scan to open the print page')}) show`);
-      lines.push('/Helvetica findfont 8 scalefont setfont');
-      lines.push(`396 402 moveto (${psText(url)}) show`);
+      qr = qrSvg(ascii, 396, 430, 148)
+        + svgText(396, 598, 11, '扫码打开打印页面', ' font-weight="bold"')
+        + svgText(396, 615, 9, url);
     } catch { /* 二维码失败不影响测试页 */ }
   }
 
-  lines.push(
-    'showpage',
-    '/Helvetica-Bold findfont 20 scalefont setfont',
-    '72 720 moveto (Page 2 of 2) show',
-    '/Helvetica findfont 12 scalefont setfont',
-    '72 690 moveto (Seeing this on the BACK of the sheet means duplex works.) show',
-    'showpage',
-    '%%EOF',
-  );
-  return lines.join('\n');
+  const first = svgPage([
+    svgText(72, 96, 22, '打印测试页 · Print-Web Test Page', ' font-weight="bold"'),
+    svgText(72, 132, 12, '打印机连接正常 · The printer is working.'),
+    svgText(72, 154, 10, stamp, ' fill="#555"'),
+    svgText(72, 198, 12, '第 1 页，共 2 页 · Page 1 of 2'),
+    svgText(72, 220, 11, '双面打印时，背面是第 2 页 · With duplex on, the back is page 2.', ' fill="#555"'),
+    qr,
+  ].join(''));
+
+  const second = svgPage([
+    svgText(72, 96, 22, '第 2 页 · Page 2', ' font-weight="bold"'),
+    svgText(72, 132, 12, '能看到这页，说明双面打印正常。'),
+    svgText(72, 154, 12, 'Seeing this on the BACK of the sheet means duplex works.'),
+  ].join(''));
+
+  return [first, second];
+}
+
+/* 两页 SVG 各转一份 PDF，再用 pdfunite 合并成作业文件（保留嵌入字体）。 */
+async function buildTestPage(url) {
+  const id = crypto.randomBytes(4).toString('hex');
+  const svg = [1, 2].map((n) => path.join(TMP, `printweb-test-${id}-${n}.svg`));
+  const pdf = svg.map((f) => f.replace(/\.svg$/, '.pdf'));
+  try {
+    const pages = await testPages(url);
+    await fsp.writeFile(svg[0], pages[0]);
+    await fsp.writeFile(svg[1], pages[1]);
+    for (let i = 0; i < 2; i++) await run(CFG.rsvg, ['-f', 'pdf', '-o', pdf[i], svg[i]]);
+    const out = path.join(TMP, `printweb-test-${id}.pdf`);
+    await run(CFG.unite, [...pdf, out]);
+    return out;
+  } finally {
+    for (const f of [...svg, ...pdf]) { try { await fsp.unlink(f); } catch {} }
+  }
 }
 
 server.listen(CFG.port, CFG.host, async () => {
   console.log(`print-web  http://${CFG.host}:${CFG.port}`);
   console.log(`queue      ${QUEUE || '(未配置)'}${CFG.dryRun ? '  (DRY RUN)' : ''}`);
-  console.log(`test page  ${HAVE_QR ? 'QR code' : 'no QR (install qrencode)'}`);
-  LAN_NAME.then((name) => console.log(`lan name   ${name || '(none, using request host)'}`));
+  console.log(`test page  ${HAVE_RSVG && HAVE_UNITE ? (HAVE_QR ? 'bilingual + QR' : 'bilingual, no QR (install qrencode)') : 'disabled (install rsvg-convert and poppler-utils)'}`);
+  LAN_HOST.then((host) => console.log(`lan host   ${host}`));
   if (!QUEUE) {
     console.warn('没有找到打印队列：设置 CUPS_QUEUE，或先在 CUPS 里配置默认队列。');
     return;

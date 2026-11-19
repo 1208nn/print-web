@@ -18,14 +18,15 @@
 | Node.js ≥ 18 | 运行服务 |
 | `cups-client` | `lp` / `lpstat` / `cancel` |
 | `ghostscript` | PostScript 转 PDF |
-| `poppler-utils`（可选） | 用 `pdfinfo` 显示页数 |
+| `poppler-utils` | 用 `pdfinfo` 显示页数、`pdfunite` 合并测试页 |
+| `rsvg-convert` + 中文字体（测试页） | 生成带中文的测试页 |
 | `qrencode`（可选） | 测试页上的二维码 |
 
 ```sh
 # Debian / Ubuntu
-apt install cups-client ghostscript poppler-utils qrencode
+apt install cups-client ghostscript poppler-utils librsvg2-bin fonts-wqy-zenhei qrencode
 # Alpine
-apk add cups-client ghostscript poppler-utils libqrencode-tools
+apk add cups-client ghostscript poppler-utils rsvg-convert font-wqy-zenhei libqrencode-tools
 ```
 
 同机需要已经配置好 CUPS 队列。
@@ -51,7 +52,7 @@ CUPS_QUEUE=my-printer node server.mjs
 | `DEFAULT_RESOLUTION` | `600` | `300` / `600` / `1200` |
 | `MAX_MB` | `50` | 单文件上限 |
 | `QUEUE_MAX` | `20` | 排队上限 |
-| `LP` / `LPSTAT` / `CANCEL` / `GS` | 同名命令 | 可执行文件路径 |
+| `LP` / `LPSTAT` / `CANCEL` / `GS` / `RSVG` | 同名命令 | 可执行文件路径 |
 | `DRY_RUN` | 空 | `1` 时不调用 `lp`，只走任务状态机 |
 
 页面上的选项会覆盖这些默认值，初始值由 `/api/status` 下发。
@@ -61,7 +62,7 @@ CUPS_QUEUE=my-printer node server.mjs
 ### OpenRC
 
 ```sh
-apk add nodejs cups-client ghostscript poppler-utils libqrencode-tools
+apk add nodejs cups-client ghostscript poppler-utils rsvg-convert font-wqy-zenhei libqrencode-tools
 
 install -d /opt/print-web
 cp -r server.mjs public /opt/print-web/
@@ -88,7 +89,7 @@ systemctl enable --now print-web
 
 用其它用户运行时，该用户需要能执行 `lp` 并访问 CUPS socket（通常在 `lp` 组）。服务单元已授予 `CAP_NET_BIND_SERVICE`，非 root 也能监听 80 端口。
 
-测试页二维码优先使用能解析的 `<hostname>.local` / `<hostname>.lan`，否则使用浏览器访问时的主机地址。
+测试页的二维码链接优先用 `<hostname>.lan`（OpenWrt 等 dnsmasq 网络可直接解析，Windows 也能用），解析不到则退回本机局域网 IPv4，不使用 `.local`。
 
 ## API
 
@@ -99,7 +100,7 @@ systemctl enable --now print-web
 | GET | `/api/jobs` | 最近 30 个任务 |
 | POST | `/api/jobs?name=&duplex=&paper=&copies=&resolution=` | body 为文件二进制 |
 | POST | `/api/jobs/:id/cancel` | 取消任务 |
-| POST | `/api/test?duplex=&paper=&resolution=` | 打印测试页（两页；含指向本站的二维码与链接） |
+| POST | `/api/test?duplex=&paper=&resolution=` | 打印测试页（两页，中英文；含指向本站的二维码与链接） |
 
 `duplex` 取 `off` / `long` / `short`，分别映射为 `lp` 的 `sides=one-sided` / `two-sided-long-edge` / `two-sided-short-edge`。
 

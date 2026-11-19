@@ -9,7 +9,7 @@
 - 拖拽或选择文件，可一次提交多个
 - 单面 / 双面长边 / 双面短边，纸张与分辨率可选
 - 右上角显示打印机名和队列状态，最近任务显示页数、时间、结果，可取消
-- 无 npm 依赖，单文件后端
+- 测试页带中英文说明和扫码链接；页面与 PDF 都在 Node 里生成
 
 ## 依赖
 
@@ -18,18 +18,18 @@
 | Node.js ≥ 18 | 运行服务 |
 | `cups-client` | `lp` / `lpstat` / `cancel` |
 | `ghostscript` | PostScript 转 PDF |
-| `poppler-utils` | 用 `pdfinfo` 显示页数、`pdfunite` 合并测试页 |
-| `rsvg-convert` + 中文字体（测试页） | 生成带中文的测试页 |
-| `qrencode`（可选） | 测试页上的二维码 |
+| 中文字体（`font-wqy-zenhei`） | 测试页的中文 |
 
 ```sh
 # Debian / Ubuntu
-apt install cups-client ghostscript poppler-utils librsvg2-bin fonts-wqy-zenhei qrencode
+apt install cups-client ghostscript fonts-wqy-zenhei
 # Alpine
-apk add cups-client ghostscript poppler-utils rsvg-convert font-wqy-zenhei libqrencode-tools
+apk add cups-client ghostscript font-wqy-zenhei
+
+npm install
 ```
 
-同机需要已经配置好 CUPS 队列。
+同机需要已经配置好 CUPS 队列。PDF 页数、二维码、测试页排版都用 Node 库完成，不需要 poppler-utils、rsvg 或 qrencode。
 
 ## 快速开始
 
@@ -52,7 +52,8 @@ CUPS_QUEUE=my-printer node server.mjs
 | `DEFAULT_RESOLUTION` | `600` | `300` / `600` / `1200` |
 | `MAX_MB` | `50` | 单文件上限 |
 | `QUEUE_MAX` | `20` | 排队上限 |
-| `LP` / `LPSTAT` / `CANCEL` / `GS` / `RSVG` | 同名命令 | 可执行文件路径 |
+| `LP` / `LPSTAT` / `CANCEL` / `GS` | 同名命令 | 可执行文件路径 |
+| `FONT_FILE` | 自动探测 | 测试页用的中文字体（TTF/TTC） |
 | `DRY_RUN` | 空 | `1` 时不调用 `lp`，只走任务状态机 |
 
 页面上的选项会覆盖这些默认值，初始值由 `/api/status` 下发。
@@ -62,10 +63,11 @@ CUPS_QUEUE=my-printer node server.mjs
 ### OpenRC
 
 ```sh
-apk add nodejs cups-client ghostscript poppler-utils rsvg-convert font-wqy-zenhei libqrencode-tools
+apk add nodejs cups-client ghostscript font-wqy-zenhei
 
 install -d /opt/print-web
-cp -r server.mjs public /opt/print-web/
+cp -r server.mjs public package.json package-lock.json /opt/print-web/
+(cd /opt/print-web && npm install --omit=dev)
 install -m755 deploy/print-web.openrc /etc/init.d/print-web
 install -m644 deploy/print-web.env.example /etc/conf.d/print-web   # 改 CUPS_QUEUE
 
@@ -79,7 +81,8 @@ rc-service print-web start
 useradd -r -G lp -s /usr/sbin/nologin print    # 需要 lp 组才能访问 CUPS socket
 
 install -d /opt/print-web
-cp -r server.mjs public /opt/print-web/
+cp -r server.mjs public package.json package-lock.json /opt/print-web/
+(cd /opt/print-web && npm install --omit=dev)
 install -m644 deploy/print-web.service /etc/systemd/system/
 install -m640 deploy/print-web.env.example /etc/print-web.env   # 改 CUPS_QUEUE
 
@@ -127,8 +130,9 @@ DRY_RUN=1 CUPS_QUEUE=test node server.mjs
 ## 目录
 
 ```
-server.mjs              后端（HTTP + CUPS 调用）
+server.mjs              后端（HTTP、CUPS、测试页 PDF）
 public/index.html       页面
+package.json            依赖：pdf-lib、fontkit、qrcode-generator
 deploy/print-web.openrc OpenRC 服务
 deploy/print-web.service systemd 服务
 deploy/print-web.env.example 环境变量示例

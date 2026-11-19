@@ -15,8 +15,11 @@ import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { PDFDocument, rgb } from 'pdf-lib';
+import fontkit from '@pdf-lib/fontkit';
+import qrcode from 'qrcode-generator';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 
@@ -31,8 +34,6 @@ const CFG = {
   lpstat: process.env.LPSTAT || 'lpstat',
   cancel: process.env.CANCEL || 'cancel',
   gs: process.env.GS || 'gs',
-  rsvg: process.env.RSVG || 'rsvg-convert',
-  unite: process.env.PDFUNITE || 'pdfunite',
   maxBytes: Number(process.env.MAX_MB || 50) * 1024 * 1024,
   queueMax: Number(process.env.QUEUE_MAX || 20),
   dryRun: process.env.DRY_RUN === '1',
@@ -44,10 +45,13 @@ const CFG = {
 };
 
 const TMP = os.tmpdir();
-const HAVE_PDFINFO = spawnSync('pdfinfo', ['-v'], { stdio: 'ignore' }).status === 0;
-const HAVE_QR = spawnSync('qrencode', ['-V'], { stdio: 'ignore' }).status === 0;
-const HAVE_RSVG = spawnSync(CFG.rsvg, ['--version'], { stdio: 'ignore' }).status === 0;
-const HAVE_UNITE = spawnSync(CFG.unite, ['-v'], { stdio: 'ignore' }).status === 0;
+const FONT_FILE = [
+  process.env.FONT_FILE,
+  '/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc',
+  '/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc',
+  '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+  '/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc',
+].filter(Boolean).find((f) => fs.existsSync(f)) || '';
 const LAN_HOST = lanHost();
 
 const cupsArgs = () => CFG.server ? ['-h', CFG.server] : [];
@@ -284,15 +288,13 @@ function detectKind(head) {
 
 async function countPages(file, kind) {
   try {
-    if (kind === 'pdf' && HAVE_PDFINFO) {
-      const out = await run('pdfinfo', [file]);
-      const m = out.match(/^Pages:\s+(\d+)/m);
-      return m ? Number(m[1]) : 0;
-    }
     if (kind === 'jpeg' || kind === 'png') return 1;
     const buf = await fsp.readFile(file);
-    const n = (buf.toString('latin1').match(/showpage/g) || []).length;
-    return n || 0;
+    if (kind === 'pdf') {
+      const doc = await PDFDocument.load(buf, { updateMetadata: false });
+      return doc.getPageCount();
+    }
+    return (buf.toString('latin1').match(/showpage/g) || []).length;
   } catch {
     return 0;
   }
@@ -472,7 +474,6 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'POST' && url.pathname === '/api/test') {
       if (!QUEUE) return json(res, 503, { error: '服务器没有配置打印队列' });
-      if (!HAVE_RSVG || !HAVE_UNITE) return json(res, 500, { error: '测试页需要 rsvg-convert 和 pdfunite' });
       const opts = parseOpts(url);
       let src;
       try {
@@ -500,85 +501,84 @@ async function pageUrl() {
   return `http://${host}${CFG.port === 80 ? '' : `:${CFG.port}`}`;
 }
 
-const FONT = "'DejaVu Sans','WenQuanYi Zen Hei','Noto Sans CJK SC','Source Han Sans SC',sans-serif";
-const xml = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-const svgText = (x, y, size, text, attrs = '') =>
-  `<text x="${x}" y="${y}" font-family="${FONT}" font-size="${size}"${attrs}>${xml(text)}</text>`;
-const svgPage = (inner) =>
-  `<svg xmlns="http://www.w3.org/2000/svg" width="595" height="842" viewBox="0 0 595 842">` +
-  `<rect width="595" height="842" fill="#fff"/>${inner}</svg>`;
-
-/* qrencode 的 ASCII 输出每个模块两列，按行合并连续暗块后画成一个 path。 */
-function qrSvg(ascii, x, y, size) {
-  const rows = ascii.replace(/\n+$/, '').split('\n');
-  const n = rows.length;
-  const m = size / n;
-  const d = [];
-  rows.forEach((row, r) => {
-    let c = 0;
-    while (c * 2 < row.length) {
-      if (row[c * 2] !== '#') { c++; continue; }
-      const start = c;
-      while (c * 2 < row.length && row[c * 2] === '#') c++;
-      const w = ((c - start) * m).toFixed(2);
-      d.push(`M${(x + start * m).toFixed(2)} ${(y + r * m).toFixed(2)}h${w}v${m.toFixed(2)}h-${w}z`);
-    }
-  });
-  return `<path fill="#000" d="${d.join('')}"/>`;
-}
-
-async function testPages(url) {
-  const stamp = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
-  let qr = '';
-  if (HAVE_QR) {
-    try {
-      const ascii = await run('qrencode', ['-t', 'ASCII', '-m', '2', '-o', '-', url]);
-      qr = qrSvg(ascii, 396, 430, 148)
-        + svgText(396, 598, 11, '扫码打开打印页面', ' font-weight="bold"')
-        + svgText(396, 615, 9, url);
-    } catch { /* 二维码失败不影响测试页 */ }
+/* 系统中文字体多为 TTC 集合，取出第一个字体（保留表偏移）供 pdf-lib 嵌入。 */
+let fontData;
+function fontBytes() {
+  if (fontData) return fontData;
+  const buf = fs.readFileSync(FONT_FILE);
+  if (buf.toString('latin1', 0, 4) !== 'ttcf') return (fontData = buf);
+  const base = buf.readUInt32BE(12);
+  const num = buf.readUInt16BE(base + 4);
+  const head = Buffer.from(buf.subarray(base, base + 12 + num * 16));
+  const parts = [head];
+  let offset = head.length;
+  for (let i = 0; i < num; i++) {
+    const rec = base + 12 + i * 16;
+    const start = buf.readUInt32BE(rec + 8);
+    const len = buf.readUInt32BE(rec + 12);
+    head.writeUInt32BE(offset, 12 + i * 16 + 8);
+    const pad = (4 - (len % 4)) % 4;
+    parts.push(buf.subarray(start, start + len), Buffer.alloc(pad));
+    offset += len + pad;
   }
-
-  const first = svgPage([
-    svgText(72, 96, 22, '打印测试页 · Print-Web Test Page', ' font-weight="bold"'),
-    svgText(72, 132, 12, '打印机连接正常 · The printer is working.'),
-    svgText(72, 154, 10, stamp, ' fill="#555"'),
-    svgText(72, 198, 12, '第 1 页，共 2 页 · Page 1 of 2'),
-    svgText(72, 220, 11, '双面打印时，背面是第 2 页 · With duplex on, the back is page 2.', ' fill="#555"'),
-    qr,
-  ].join(''));
-
-  const second = svgPage([
-    svgText(72, 96, 22, '第 2 页 · Page 2', ' font-weight="bold"'),
-    svgText(72, 132, 12, '能看到这页，说明双面打印正常。'),
-    svgText(72, 154, 12, 'Seeing this on the BACK of the sheet means duplex works.'),
-  ].join(''));
-
-  return [first, second];
+  return (fontData = Buffer.concat(parts));
 }
 
-/* 两页 SVG 各转一份 PDF，再用 pdfunite 合并成作业文件（保留嵌入字体）。 */
 async function buildTestPage(url) {
-  const id = crypto.randomBytes(4).toString('hex');
-  const svg = [1, 2].map((n) => path.join(TMP, `printweb-test-${id}-${n}.svg`));
-  const pdf = svg.map((f) => f.replace(/\.svg$/, '.pdf'));
-  try {
-    const pages = await testPages(url);
-    await fsp.writeFile(svg[0], pages[0]);
-    await fsp.writeFile(svg[1], pages[1]);
-    for (let i = 0; i < 2; i++) await run(CFG.rsvg, ['-f', 'pdf', '-o', pdf[i], svg[i]]);
-    const out = path.join(TMP, `printweb-test-${id}.pdf`);
-    await run(CFG.unite, [...pdf, out]);
-    return out;
-  } finally {
-    for (const f of [...svg, ...pdf]) { try { await fsp.unlink(f); } catch {} }
+  if (!FONT_FILE) throw new Error('找不到中文字体，请安装 font-wqy-zenhei 或设置 FONT_FILE');
+
+  const doc = await PDFDocument.create();
+  doc.registerFontkit(fontkit);
+  const font = await doc.embedFont(fontBytes(), { subset: true });
+  const gray = rgb(0.35, 0.35, 0.35);
+  const text = (page, str, x, y, size, color = rgb(0, 0, 0)) =>
+    page.drawText(str, { x, y, size, font, color });
+
+  const stamp = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+  const first = doc.addPage([595, 842]);
+  text(first, '打印测试页 · Print-Web Test Page', 72, 746, 22);
+  text(first, '打印机连接正常 · The printer is working.', 72, 710, 12);
+  text(first, stamp, 72, 688, 9, gray);
+  text(first, '第 1 页，共 2 页 · Page 1 of 2', 72, 644, 12);
+  text(first, '双面打印时，背面是第 2 页 · With duplex on, the back is page 2.', 72, 622, 10, gray);
+
+  const qr = qrcode(0, 'M');
+  qr.addData(url);
+  qr.make();
+  const n = qr.getModuleCount();
+  const m = 148 / n;
+  for (let r = 0; r < n; r++) {
+    let c = 0;
+    while (c < n) {
+      if (!qr.isDark(r, c)) { c++; continue; }
+      const start = c;
+      while (c < n && qr.isDark(r, c)) c++;
+      first.drawRectangle({
+        x: 396 + start * m,
+        y: 452 + (n - 1 - r) * m,
+        width: (c - start) * m,
+        height: m,
+        color: rgb(0, 0, 0),
+      });
+    }
   }
+  text(first, '扫码打开打印页面', 396, 432, 11);
+  text(first, url, 396, 415, 9, gray);
+
+  const second = doc.addPage([595, 842]);
+  text(second, '第 2 页 · Page 2', 72, 746, 22);
+  text(second, '能看到这页，说明双面打印正常。', 72, 710, 12);
+  text(second, 'Seeing this on the BACK of the sheet means duplex works.', 72, 690, 12);
+
+  const file = path.join(TMP, `printweb-test-${crypto.randomBytes(4).toString('hex')}.pdf`);
+  await fsp.writeFile(file, await doc.save());
+  return file;
 }
 
 server.listen(CFG.port, CFG.host, async () => {
   console.log(`print-web  http://${CFG.host}:${CFG.port}`);
   console.log(`queue      ${QUEUE || '(未配置)'}${CFG.dryRun ? '  (DRY RUN)' : ''}`);
-  console.log(`test page  ${HAVE_RSVG && HAVE_UNITE ? (HAVE_QR ? 'bilingual + QR' : 'bilingual, no QR (install qrencode)') : 'disabled (install rsvg-convert and poppler-utils)'}`);
+  console.log(`test page  ${FONT_FILE ? 'bilingual + QR' : 'disabled (no CJK font)'}`);
   LAN_HOST.then((host) => console.log(`lan host   ${host}`));
   if (!QUEUE) {
     console.warn('没有找到打印队列：设置 CUPS_QUEUE，或先在 CUPS 里配置默认队列。');

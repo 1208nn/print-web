@@ -1,0 +1,22 @@
+{
+  "name": "print-web",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal web UI for printing PDFs, images and text through CUPS",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs",
+    "check": "node --check server.mjs"
+  },
+  "keywords": [
+    "cups",
+    "printing",
+    "printer",
+    "web",
+    "airprint"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,0 +1,26 @@
+[Unit]
+Description=print-web (CUPS web front-end)
+After=network-online.target cups.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 需要读 CUPS socket：建议使用专用用户并加入 lp 组
+#   useradd -r -G lp -s /usr/sbin/nologin print
+User=print
+Group=print
+WorkingDirectory=/opt/print-web
+EnvironmentFile=-/etc/print-web.env
+ExecStart=/usr/bin/node /opt/print-web/server.mjs
+Restart=always
+RestartSec=2
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

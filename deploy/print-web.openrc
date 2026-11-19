@@ -1,0 +1,20 @@
+#!/sbin/openrc-run
+
+name="print-web"
+description="Web front-end for a CUPS print queue"
+
+command="/usr/bin/node"
+command_args="/opt/print-web/server.mjs"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+
+if [ -f "/etc/conf.d/${RC_SVCNAME}" ]; then
+	set -a
+	. "/etc/conf.d/${RC_SVCNAME}"
+	set +a
+fi
+
+depend() {
+	need net
+	after cupsd
+}

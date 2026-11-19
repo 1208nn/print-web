@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>在线打印</title>
+<style>
+  :root{
+    --bg:#fff; --fg:#111318; --muted:#52525b; --line:#d3d7de; --field:#fff;
+    --accent:#1d4ed8; --ok:#047857; --warn:#b45309; --err:#b91c1c;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{ --bg:#0d0f12; --fg:#eceff4; --muted:#b5bdca; --line:#3a414d; --field:#181c22;
+           --ok:#34d399; --warn:#fbbf24; --err:#f87171; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:16px/1.55 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
+  main{max-width:680px;margin:0 auto;padding:24px 16px 64px}
+  header{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  h1{font-size:20px;margin:0;font-weight:650}
+  #status{margin-left:auto;display:flex;align-items:center;gap:7px;min-width:0;max-width:72%;
+    font-size:13px;color:var(--muted)}
+  #stext{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .dot{flex:none;width:8px;height:8px;border-radius:50%;background:#9ca3af}
+  .dot.ok{background:var(--ok)} .dot.bad{background:var(--err)} .dot.wait{background:var(--warn)}
+
+  .drop{margin-top:24px;border:1.5px dashed var(--line);border-radius:12px;padding:26px 16px;
+    text-align:center;cursor:pointer}
+  .drop:hover,.drop.over{border-color:var(--accent)}
+  .drop b{display:block;font-size:16px}
+  .drop span{font-size:13px;color:var(--muted)}
+
+  ul{list-style:none;margin:0;padding:0}
+  #files li{display:flex;align-items:center;gap:10px;padding:10px 2px;
+    border-bottom:1px solid var(--line);font-size:14px}
+  .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .sz{color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}
+
+  .opts{margin-top:20px;display:grid;grid-template-columns:repeat(auto-fit,minmax(128px,1fr));gap:12px}
+  label{display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--muted)}
+  select,input{font:inherit;font-size:15px;color:var(--fg);background:var(--field);
+    border:1px solid var(--line);border-radius:9px;padding:9px 10px;width:100%}
+
+  .actions{margin-top:18px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  button{font:inherit;border-radius:10px;padding:11px 20px;cursor:pointer}
+  .primary{background:var(--accent);color:#fff;border:0;font-weight:600}
+  .primary:hover{background:#1e40af}
+  .primary:disabled{opacity:.45;cursor:not-allowed}
+  .ghost{background:transparent;color:var(--fg);border:1px solid var(--line)}
+  .ghost:hover{border-color:var(--accent);color:var(--accent)}
+  #hint{font-size:13px;color:var(--muted)}
+
+  h2{margin:34px 0 2px;font-size:13px;letter-spacing:.05em;color:var(--muted);font-weight:600}
+  .list li{display:flex;align-items:center;gap:10px;padding:11px 0;border-bottom:1px solid var(--line)}
+  .body{flex:1;min-width:0}
+  .name{display:block;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .meta{display:block;margin-top:1px;font-size:12px;color:var(--muted)}
+  .badge{flex:none;font-size:12px;padding:3px 9px;border-radius:999px;
+    border:1px solid var(--line);color:var(--muted)}
+  .badge.run{color:var(--accent);border-color:var(--accent)}
+  .badge.done{color:var(--ok);border-color:var(--ok)}
+  .badge.error{color:var(--err);border-color:var(--err)}
+  .err{display:block;margin-top:2px;font-size:12px;color:var(--err)}
+  .x{flex:none;border:0;background:transparent;color:var(--muted);font-size:20px;line-height:1;
+    padding:4px 8px;border-radius:8px;min-width:36px;cursor:pointer}
+  .x:hover{color:var(--err)}
+  .empty{margin:10px 0 0;font-size:14px;color:var(--muted)}
+
+  details{margin-top:34px;border-top:1px solid var(--line);padding-top:18px;
+    font-size:14px;color:var(--muted)}
+  summary{cursor:pointer}
+  details ul{margin:10px 0 0;padding-left:20px}
+</style>
+</head>
+<body>
+<main>
+
+  <header>
+    <h1>在线打印</h1>
+    <div id="status"><span class="dot wait" id="dot"></span><span id="stext">检查中…</span></div>
+  </header>
+
+  <div class="drop" id="drop" role="button" tabindex="0">
+    <b>选择文件</b>
+    <span>PDF · 图片 · 文本 · 最大 50 MB</span>
+    <input type="file" id="file" multiple hidden
+           accept=".pdf,.ps,.eps,.jpg,.jpeg,.png,.txt,application/pdf,image/jpeg,image/png,text/plain">
+  </div>
+  <ul id="files"></ul>
+
+  <div class="opts">
+    <label>双面
+      <select id="duplex">
+        <option value="long" selected>双面 · 长边</option>
+        <option value="short">双面 · 短边</option>
+        <option value="off">单面</option>
+      </select>
+    </label>
+    <label>纸张
+      <select id="paper">
+        <option value="auto" selected>跟随文件</option>
+        <option value="a4">A4</option>
+        <option value="letter">Letter</option>
+        <option value="legal">Legal</option>
+        <option value="a5">A5</option>
+      </select>
+    </label>
+    <label>份数
+      <input type="number" id="copies" min="1" max="99" value="1">
+    </label>
+    <label>清晰度
+      <select id="resolution">
+        <option value="300">300 dpi</option>
+        <option value="600" selected>600 dpi</option>
+        <option value="1200">1200 dpi</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="actions">
+    <button class="primary" id="go" disabled>打印</button>
+    <button class="ghost" id="test">测试页</button>
+    <span id="hint"></span>
+  </div>
+
+  <h2>最近打印</h2>
+  <ul class="list" id="jobs"></ul>
+  <p class="empty" id="empty">暂无记录</p>
+
+  <details>
+    <summary>说明</summary>
+    <ul>
+      <li>中文请先「打印成 PDF」再上传。</li>
+      <li>缺纸时会停在「正在打印」，补纸后继续。</li>
+    </ul>
+  </details>
+
+</main>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const MAXMB = 50;
+  let files = [];
+  let uploading = false;
+  let timer;
+  let defaultsApplied = false;
+
+  const size = (n) => n < 1024 ? n + ' B'
+    : n < 1048576 ? Math.round(n / 1024) + ' KB'
+    : (n / 1048576).toFixed(1) + ' MB';
+  const clock = (ms) => new Date(ms).toTimeString().slice(0, 5);
+  const opts = () => ({
+    duplex: $('duplex').value,
+    paper: $('paper').value,
+    copies: $('copies').value,
+    resolution: $('resolution').value,
+  });
+
+  /* 状态 */
+  const STATE = { idle: '空闲', printing: '正在打印', disabled: '已暂停', missing: '找不到打印机', unconfigured: '未配置队列', unknown: '未知' };
+  async function pollStatus() {
+    try {
+      const s = await (await fetch('/api/status')).json();
+      if (!defaultsApplied && s.defaults) {
+        defaultsApplied = true;
+        $('duplex').value = s.defaults.duplex;
+        $('paper').value = s.defaults.paper;
+        $('resolution').value = s.defaults.resolution;
+      }
+      $('dot').className = 'dot ' + (s.dryRun ? 'wait' : s.ok ? 'ok' : 'bad');
+      $('stext').textContent = `${s.printer || '打印机'} · ${s.dryRun ? '测试模式' : STATE[s.state] || '未知'}`;
+      $('hint').textContent = s.busy ? '正在提交…' : '';
+    } catch {
+      $('dot').className = 'dot bad';
+      $('stext').textContent = '连不上服务';
+    }
+  }
+  pollStatus();
+  setInterval(pollStatus, 5000);
+
+  /* 文件 */
+  function renderFiles() {
+    const ul = $('files');
+    ul.innerHTML = '';
+    files.forEach((f, i) => {
+      const li = document.createElement('li');
+      li.innerHTML = `<span class="nm"></span><span class="sz">${size(f.size)}</span><button class="x" title="移除">×</button>`;
+      li.querySelector('.nm').textContent = f.name;
+      li.querySelector('.x').onclick = () => { files.splice(i, 1); renderFiles(); };
+      ul.appendChild(li);
+    });
+    $('go').disabled = !files.length || uploading;
+  }
+
+  function addFiles(list) {
+    for (const f of list) {
+      if (f.size > MAXMB * 1048576) { alert(`${f.name} 超过 ${MAXMB} MB`); continue; }
+      if (!files.some((x) => x.name === f.name && x.size === f.size)) files.push(f);
+    }
+    renderFiles();
+  }
+
+  const drop = $('drop'), input = $('file');
+  drop.onclick = () => input.click();
+  drop.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); input.click(); } };
+  input.onchange = () => { addFiles(input.files); input.value = ''; };
+  ['dragenter', 'dragover'].forEach((ev) => drop.addEventListener(ev, (e) => {
+    e.preventDefault(); drop.classList.add('over');
+  }));
+  ['dragleave', 'drop'].forEach((ev) => drop.addEventListener(ev, (e) => {
+    e.preventDefault(); drop.classList.remove('over');
+  }));
+  drop.addEventListener('drop', (e) => addFiles(e.dataTransfer.files));
+
+  /* 上传 */
+  function upload(file, query) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/api/jobs?' + new URLSearchParams({ name: file.name, ...query }));
+      xhr.setRequestHeader('content-type', file.type || 'application/octet-stream');
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) $('hint').textContent = `上传 ${Math.round(e.loaded / e.total * 100)}%`;
+      };
+      xhr.onload = () => {
+        if (xhr.status < 300) return resolve();
+        let msg = xhr.statusText;
+        try { msg = JSON.parse(xhr.responseText).error || msg; } catch {}
+        reject(new Error(msg));
+      };
+      xhr.onerror = () => reject(new Error('网络错误'));
+      xhr.send(file);
+    });
+  }
+
+  $('go').onclick = async () => {
+    uploading = true;
+    renderFiles();
+    const failed = [];
+    for (const f of files.slice()) {
+      try {
+        await upload(f, opts());
+        files = files.filter((x) => x !== f);
+      } catch (e) {
+        failed.push(`${f.name}：${e.message}`);
+      }
+      renderFiles();
+    }
+    uploading = false;
+    renderFiles();
+    $('hint').textContent = failed.join('；');
+    jobs();
+  };
+
+  $('test').onclick = async () => {
+    try {
+      const r = await fetch('/api/test?' + new URLSearchParams(opts()), { method: 'POST' });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || '测试页失败');
+      jobs();
+    } catch (e) {
+      alert(e.message);
+    }
+  };
+
+  /* 打印记录 */
+  const LABEL = { queued: '排队中', sending: '已发送', done: '已完成', error: '失败', canceled: '已取消' };
+  const CLS = { sending: 'run', done: 'done', error: 'error' };
+
+  async function jobs() {
+    clearTimeout(timer);
+    try {
+      const { jobs: list } = await (await fetch('/api/jobs')).json();
+      renderJobs(list);
+      if (list.some((j) => j.status === 'queued' || j.status === 'sending')) timer = setTimeout(jobs, 1500);
+    } catch {}
+  }
+
+  function renderJobs(list) {
+    const ul = $('jobs');
+    ul.innerHTML = '';
+    $('empty').style.display = list.length ? 'none' : 'block';
+    for (const j of list) {
+      const li = document.createElement('li');
+
+      const body = document.createElement('div');
+      body.className = 'body';
+      body.innerHTML = '<span class="name"></span><span class="meta"></span>';
+      body.querySelector('.name').textContent = j.name;
+      body.querySelector('.meta').textContent =
+        ['#' + j.no, j.pages && j.pages + ' 页', j.finishedAt && clock(j.finishedAt)].filter(Boolean).join(' · ');
+      if (j.error) {
+        const e = document.createElement('span');
+        e.className = 'err';
+        e.textContent = j.error;
+        body.appendChild(e);
+      }
+
+      const badge = document.createElement('span');
+      badge.className = 'badge ' + (CLS[j.status] || '');
+      badge.textContent = LABEL[j.status] || j.status;
+
+      li.append(body, badge);
+
+      if (j.status === 'queued' || (j.status === 'sending' && j.cupsId)) {
+        const x = document.createElement('button');
+        x.className = 'x';
+        x.title = '取消';
+        x.textContent = '×';
+        x.onclick = async () => { await fetch(`/api/jobs/${j.id}/cancel`, { method: 'POST' }); jobs(); };
+        li.append(x);
+      }
+      ul.appendChild(li);
+    }
+  }
+
+  jobs();
+})();
+</script>
+</body>
+</html>

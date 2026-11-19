@@ -24,7 +24,7 @@ const pick = (value, allowed, fallback) => allowed.includes(value) ? value : fal
 
 const CFG = {
   host: process.env.HOST || '0.0.0.0',
-  port: Number(process.env.PORT || 8080),
+  port: Number(process.env.PORT || 80),
   queue: process.env.CUPS_QUEUE || '', // 留空则用 lpstat -d 的默认队列
   server: process.env.CUPS_SERVER || '', // 非本机 CUPS 时填 host:port
   lp: process.env.LP || 'lp',
@@ -43,6 +43,8 @@ const CFG = {
 
 const TMP = os.tmpdir();
 const HAVE_PDFINFO = spawnSync('pdfinfo', ['-v'], { stdio: 'ignore' }).status === 0;
+const HAVE_QR = spawnSync('qrencode', ['-V'], { stdio: 'ignore' }).status === 0;
+const LAN_NAME = lanName();
 
 const cupsArgs = () => CFG.server ? ['-h', CFG.server] : [];
 
@@ -56,6 +58,22 @@ async function defaultQueue() {
   } catch {
     return '';
   }
+}
+
+async function lanName() {
+  const base = os.hostname();
+  const probes = [
+    [`${base}.local`, 'avahi-resolve', ['-n', `${base}.local`]],
+    [`${base}.local`, 'getent', ['hosts', `${base}.local`]],
+    [`${base}.lan`, 'getent', ['hosts', `${base}.lan`]],
+  ];
+  for (const [name, cmd, args] of probes) {
+    try {
+      await run(cmd, args);
+      return name;
+    } catch { /* 换下一种解析方式 */ }
+  }
+  return '';
 }
 
 /* ------------------------------------------------------------------ 任务状态 */
@@ -446,7 +464,7 @@ const server = http.createServer(async (req, res) => {
       if (!QUEUE) return json(res, 503, { error: '服务器没有配置打印队列' });
       const opts = parseOpts(url);
       const tmp = path.join(TMP, `printweb-test-${crypto.randomBytes(4).toString('hex')}.ps`);
-      await fsp.writeFile(tmp, testPage());
+      await fsp.writeFile(tmp, await testPage(await pageUrl(req)));
       let src;
       try {
         src = await psToPdf(tmp);
@@ -469,16 +487,56 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-function testPage() {
-  return [
+async function pageUrl(req) {
+  const host = (await LAN_NAME) || String(req.headers.host || '').replace(/:\d+$/, '') || 'localhost';
+  return `http://${host}${CFG.port === 80 ? '' : `:${CFG.port}`}`;
+}
+
+const psText = (s) => s.replace(/[()\\]/g, '\\$&');
+
+/* qrencode 的 ASCII 输出每个模块两列，按行合并连续暗块后画成矩形。 */
+function qrOps(ascii, x, y, size) {
+  const rows = ascii.replace(/\n+$/, '').split('\n');
+  const n = rows.length;
+  const m = size / n;
+  const ops = ['gsave', '0 setgray', `${x} ${y} translate`];
+  rows.forEach((row, r) => {
+    let c = 0;
+    while (c * 2 < row.length) {
+      if (row[c * 2] !== '#') { c++; continue; }
+      const start = c;
+      while (c * 2 < row.length && row[c * 2] === '#') c++;
+      const w = (c - start) * m;
+      ops.push(`${(start * m).toFixed(2)} ${((n - 1 - r) * m).toFixed(2)} ${w.toFixed(2)} ${m.toFixed(2)} rectfill`);
+    }
+  });
+  ops.push('grestore');
+  return ops.join('\n');
+}
+
+async function testPage(url) {
+  const lines = [
     '%!PS-Adobe-3.0',
     '/Helvetica-Bold findfont 24 scalefont setfont',
     '72 720 moveto (Print-Web Test Page) show',
     '/Helvetica findfont 12 scalefont setfont',
     '72 690 moveto (If you can read this, the queue is working.) show',
-    '72 670 moveto (Time: ' + new Date().toISOString().replace(/[()\\]/g, '') + ') show',
+    `72 670 moveto (Time: ${psText(new Date().toISOString())}) show`,
     '72 640 moveto (Page 1 of 2. With duplex on, the back is the other half.) show',
-    '60 60 60 60 rectstroke',
+  ];
+
+  if (HAVE_QR) {
+    try {
+      const ascii = await run('qrencode', ['-t', 'ASCII', '-m', '2', '-o', '-', url]);
+      lines.push(qrOps(ascii, 396, 430, 150));
+      lines.push('/Helvetica-Bold findfont 10 scalefont setfont');
+      lines.push(`396 414 moveto (${psText('Scan to open the print page')}) show`);
+      lines.push('/Helvetica findfont 8 scalefont setfont');
+      lines.push(`396 402 moveto (${psText(url)}) show`);
+    } catch { /* 二维码失败不影响测试页 */ }
+  }
+
+  lines.push(
     'showpage',
     '/Helvetica-Bold findfont 20 scalefont setfont',
     '72 720 moveto (Page 2 of 2) show',
@@ -486,12 +544,15 @@ function testPage() {
     '72 690 moveto (Seeing this on the BACK of the sheet means duplex works.) show',
     'showpage',
     '%%EOF',
-  ].join('\n');
+  );
+  return lines.join('\n');
 }
 
 server.listen(CFG.port, CFG.host, async () => {
   console.log(`print-web  http://${CFG.host}:${CFG.port}`);
   console.log(`queue      ${QUEUE || '(未配置)'}${CFG.dryRun ? '  (DRY RUN)' : ''}`);
+  console.log(`test page  ${HAVE_QR ? 'QR code' : 'no QR (install qrencode)'}`);
+  LAN_NAME.then((name) => console.log(`lan name   ${name || '(none, using request host)'}`));
   if (!QUEUE) {
     console.warn('没有找到打印队列：设置 CUPS_QUEUE，或先在 CUPS 里配置默认队列。');
     return;

@@ -19,12 +19,13 @@
 | `cups-client` | `lp` / `lpstat` / `cancel` |
 | `ghostscript` | PostScript 转 PDF |
 | `poppler-utils`（可选） | 用 `pdfinfo` 显示页数 |
+| `qrencode`（可选） | 测试页上的二维码 |
 
 ```sh
 # Debian / Ubuntu
-apt install cups-client ghostscript poppler-utils
+apt install cups-client ghostscript poppler-utils qrencode
 # Alpine
-apk add cups-client ghostscript poppler-utils
+apk add cups-client ghostscript poppler-utils libqrencode-tools
 ```
 
 同机需要已经配置好 CUPS 队列。
@@ -35,14 +36,14 @@ apk add cups-client ghostscript poppler-utils
 CUPS_QUEUE=my-printer node server.mjs
 ```
 
-打开 `http://localhost:8080`。不设 `CUPS_QUEUE` 时自动使用 `lpstat -d` 的默认队列；找不到队列服务仍会启动，提交时返回 503。
+打开 `http://localhost`。默认监听 80 端口，非 root 运行时可改用 `PORT=8080`。不设 `CUPS_QUEUE` 时自动使用 `lpstat -d` 的默认队列；找不到队列服务仍会启动，提交时返回 503。
 
 ## 配置
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `HOST` | `0.0.0.0` | 监听地址 |
-| `PORT` | `8080` | 监听端口 |
+| `PORT` | `80` | 监听端口 |
 | `CUPS_QUEUE` | 空 | 目标队列；留空用系统默认队列 |
 | `CUPS_SERVER` | 空 | 远端 CUPS，填 `host:port` |
 | `DEFAULT_DUPLEX` | `long` | `off` / `long` / `short` |
@@ -60,7 +61,7 @@ CUPS_QUEUE=my-printer node server.mjs
 ### OpenRC
 
 ```sh
-apk add nodejs cups-client ghostscript poppler-utils
+apk add nodejs cups-client ghostscript poppler-utils libqrencode-tools
 
 install -d /opt/print-web
 cp -r server.mjs public /opt/print-web/
@@ -85,7 +86,9 @@ systemctl daemon-reload
 systemctl enable --now print-web
 ```
 
-用其它用户运行时，该用户需要能执行 `lp` 并访问 CUPS socket（通常在 `lp` 组）。
+用其它用户运行时，该用户需要能执行 `lp` 并访问 CUPS socket（通常在 `lp` 组）。服务单元已授予 `CAP_NET_BIND_SERVICE`，非 root 也能监听 80 端口。
+
+测试页二维码优先使用能解析的 `<hostname>.local` / `<hostname>.lan`，否则使用浏览器访问时的主机地址。
 
 ## API
 
@@ -96,7 +99,7 @@ systemctl enable --now print-web
 | GET | `/api/jobs` | 最近 30 个任务 |
 | POST | `/api/jobs?name=&duplex=&paper=&copies=&resolution=` | body 为文件二进制 |
 | POST | `/api/jobs/:id/cancel` | 取消任务 |
-| POST | `/api/test?duplex=&paper=&resolution=` | 打印测试页（两页，双面时正反面） |
+| POST | `/api/test?duplex=&paper=&resolution=` | 打印测试页（两页；含指向本站的二维码与链接） |
 
 `duplex` 取 `off` / `long` / `short`，分别映射为 `lp` 的 `sides=one-sided` / `two-sided-long-edge` / `two-sided-short-edge`。
 

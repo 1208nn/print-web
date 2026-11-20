@@ -7,7 +7,7 @@
  * 任何 CUPS 队列都可以用。网页提交的作业与 AirPrint、桌面客户端
  * 共用同一个队列和同一条过滤链。
  *
- * 无 npm 依赖；需要 node >= 18、cups-client，PostScript 输入还需要 ghostscript。
+ * 运行需要 node >= 18、cups-client；PostScript 输入还需要 ghostscript。
  */
 import http from 'node:http';
 import fs from 'node:fs';
@@ -15,6 +15,7 @@ import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import dgram from 'node:dgram';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { PDFDocument, rgb } from 'pdf-lib';
@@ -37,6 +38,7 @@ const CFG = {
   maxBytes: Number(process.env.MAX_MB || 50) * 1024 * 1024,
   queueMax: Number(process.env.QUEUE_MAX || 20),
   dryRun: process.env.DRY_RUN === '1',
+  discover: process.env.DISCOVER !== '0',
   defaults: {
     duplex: pick(process.env.DEFAULT_DUPLEX, ['off', 'long', 'short'], 'long'),
     paper: pick(process.env.DEFAULT_PAPER, ['auto', 'a4', 'letter', 'legal', 'a5'], 'auto'),
@@ -88,6 +90,119 @@ function primaryIPv4() {
     .map((n) => n.address)
     .sort((a, b) => score(a) - score(b));
   return list[0] || 'localhost';
+}
+
+/* ------------------------------------------------------------------ 网络发现 */
+
+/* Windows 的“网络”面板用 SSDP/UPnP 发现设备。把网页发布成一个 Basic 设备，
+   局域网里就会出现“打印网页”，双击直接打开本页。 */
+
+const UPNP_ADDR = '239.255.255.250';
+const UPNP_PORT = 1900;
+const UPNP_TYPE = 'urn:schemas-upnp-org:device:Basic:1';
+const UDN = `uuid:${crypto.createHash('sha1')
+  .update(`${os.hostname()}:${Object.values(os.networkInterfaces()).flat()
+    .find((n) => n && !n.internal && n.mac && n.mac !== '00:00:00:00:00:00')?.mac || ''}`)
+  .digest('hex')
+  .slice(0, 32)
+  .replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, '$1-$2-$3-$4-$5')}`;
+const UPNP_TARGETS = ['upnp:rootdevice', UPNP_TYPE, UDN];
+
+const upnpUsn = (st) => st === UDN ? UDN : `${UDN}::${st}`;
+const upnpBase = (ip) => `http://${ip}${CFG.port === 80 ? '' : `:${CFG.port}`}`;
+
+let upnpSocket = null;
+let upnpTimer = null;
+let upnpLocation = '';
+
+function upnpXml(ip) {
+  return `<?xml version="1.0" encoding="utf-8"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <specVersion><major>1</major><minor>0</minor></specVersion>
+  <device>
+    <deviceType>${UPNP_TYPE}</deviceType>
+    <friendlyName>打印网页 · ${os.hostname()}</friendlyName>
+    <manufacturer>print-web</manufacturer>
+    <modelDescription>Web print page for CUPS</modelDescription>
+    <modelName>print-web</modelName>
+    <modelNumber>1.0</modelNumber>
+    <UDN>${UDN}</UDN>
+    <serviceList></serviceList>
+    <presentationURL>${upnpBase(ip)}/</presentationURL>
+  </device>
+</root>`;
+}
+
+function upnpSend(lines, port, address) {
+  if (!upnpSocket) return;
+  try {
+    upnpSocket.send(Buffer.from([...lines, '', ''].join('\r\n')), port, address, () => {});
+  } catch { /* 发现失败不影响打印 */ }
+}
+
+function upnpNotify(nts) {
+  for (const nt of UPNP_TARGETS) {
+    const lines = ['NOTIFY * HTTP/1.1', `HOST: ${UPNP_ADDR}:${UPNP_PORT}`];
+    if (nts === 'ssdp:alive') {
+      lines.push('CACHE-CONTROL: max-age=1800', `LOCATION: ${upnpLocation}`, 'SERVER: Linux/1.0 UPnP/1.1 print-web/1.0');
+    }
+    lines.push(`NT: ${nt}`, `NTS: ${nts}`, `USN: ${upnpUsn(nt)}`);
+    upnpSend(lines, UPNP_PORT, UPNP_ADDR);
+  }
+}
+
+function startUpnp() {
+  if (!CFG.discover || CFG.host === '127.0.0.1') return;
+  const ip = primaryIPv4();
+  if (ip === 'localhost') return;
+  upnpLocation = `${upnpBase(ip)}/description.xml`;
+  upnpSocket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+  upnpSocket.on('error', (e) => {
+    console.warn(`discovery  ${e.message}`);
+    stopUpnp();
+  });
+  upnpSocket.on('message', (buf, rinfo) => {
+    const text = buf.toString('latin1');
+    if (!/^M-SEARCH /i.test(text)) return;
+    const st = (/^ST:\s*(.+?)\s*$/im.exec(text) || [])[1];
+    if (!st) return;
+    const list = st.toLowerCase() === 'ssdp:all'
+      ? UPNP_TARGETS
+      : UPNP_TARGETS.filter((t) => t.toLowerCase() === st.toLowerCase());
+    for (const t of list) {
+      upnpSend([
+        'HTTP/1.1 200 OK',
+        'CACHE-CONTROL: max-age=1800',
+        `DATE: ${new Date().toUTCString()}`,
+        'EXT:',
+        `LOCATION: ${upnpLocation}`,
+        'SERVER: Linux/1.0 UPnP/1.1 print-web/1.0',
+        `ST: ${t}`,
+        `USN: ${upnpUsn(t)}`,
+      ], rinfo.port, rinfo.address);
+    }
+  });
+  upnpSocket.bind(UPNP_PORT, () => {
+    for (const n of Object.values(os.networkInterfaces()).flat()) {
+      if (n && n.family === 'IPv4' && !n.internal) {
+        try { upnpSocket.addMembership(UPNP_ADDR, n.address); } catch { /* 某些接口不支持组播 */ }
+      }
+    }
+    try { upnpSocket.setMulticastInterface(ip); } catch { /* ignore */ }
+    upnpNotify('ssdp:alive');
+    upnpTimer = setInterval(() => upnpNotify('ssdp:alive'), 900_000);
+    upnpTimer.unref();
+    console.log(`discovery  ${upnpBase(ip)} (UPnP)`);
+  });
+}
+
+function stopUpnp() {
+  if (!upnpSocket) return;
+  clearInterval(upnpTimer);
+  try { upnpNotify('ssdp:byebye'); } catch { /* ignore */ }
+  const sock = upnpSocket;
+  upnpSocket = null;
+  try { sock.close(); } catch { /* ignore */ }
 }
 
 /* ------------------------------------------------------------------ 任务状态 */
@@ -422,6 +537,11 @@ const server = http.createServer(async (req, res) => {
       return res.end(INDEX);
     }
 
+    if (req.method === 'GET' && url.pathname === '/description.xml') {
+      res.writeHead(200, { 'content-type': 'text/xml; charset=utf-8', 'cache-control': 'no-store' });
+      return res.end(upnpXml(primaryIPv4()));
+    }
+
     if (req.method === 'GET' && url.pathname === '/api/status') {
       const q = await queueState();
       return json(res, 200, {
@@ -580,6 +700,7 @@ server.listen(CFG.port, CFG.host, async () => {
   console.log(`queue      ${QUEUE || '(未配置)'}${CFG.dryRun ? '  (DRY RUN)' : ''}`);
   console.log(`test page  ${FONT_FILE ? 'bilingual + QR' : 'disabled (no CJK font)'}`);
   LAN_HOST.then((host) => console.log(`lan host   ${host}`));
+  startUpnp();
   if (!QUEUE) {
     console.warn('没有找到打印队列：设置 CUPS_QUEUE，或先在 CUPS 里配置默认队列。');
     return;
@@ -587,3 +708,10 @@ server.listen(CFG.port, CFG.host, async () => {
   const q = await queueState();
   console.log(`cups       ${q.state}${q.error ? ` (${q.error})` : ''}`);
 });
+
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => {
+    stopUpnp();
+    process.exit(0);
+  });
+}
